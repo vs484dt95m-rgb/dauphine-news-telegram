@@ -1,29 +1,21 @@
 import os
-import re
+import json
 import logging
-import urllib.parse
-import psycopg2
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify
-from atproto import Client as BlueskyClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = Flask(__name__)
 
 # --- VARIABLES D'ENVIRONNEMENT ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
 FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
-
-BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE")
-BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 
 PIAILLE_INSTANCE = os.getenv("PIAILLE_INSTANCE", "https://piaille.fr")
 PIAILLE_TOKEN = os.getenv("PIAILLE_TOKEN")
@@ -35,82 +27,67 @@ RSS_FEEDS = [
     "https://www.placegrenet.fr/feed"
 ]
 
-# --- BASE DE DONNÉES POSTGRESQL (PERSISTANTE & GRATUITE) ---
-def init_db():
-    """Initialise la table des articles publiés si elle n'existe pas."""
-    if not DATABASE_URL:
-        logging.warning("DATABASE_URL absente ! L'anti-doublon ne sera pas persistant.")
-        return
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS published_articles (
-            id SERIAL PRIMARY KEY,
-            link TEXT UNIQUE NOT NULL,
-            published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+# --- GESTION ANTI-DOUBLON VIA FICHIER LOCAL (JSON) ---
+HISTORY_FILE = "published.json"
+
+def load_history():
+    """Charge la liste des liens déjà publiés depuis le fichier JSON."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Erreur de lecture de l'historique: {e}")
+    return []
+
+def save_history(history):
+    """Sauvegarde la liste des liens (limitée aux 100 derniers)."""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-100:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Erreur d'écriture de l'historique: {e}")
 
 def is_already_published(link):
-    if not DATABASE_URL:
-        return False
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM published_articles WHERE link = %s;", (link,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result is not None
+    history = load_history()
+    return link in history
 
 def mark_as_published(link):
-    if not DATABASE_URL:
-        return
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO published_articles (link) VALUES (%s) ON CONFLICT DO NOTHING;", (link,))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Erreur d'enregistrement DB: {e}")
-    finally:
-        cur.close()
-        conn.close()
+    history = load_history()
+    if link not in history:
+        history.append(link)
+        save_history(history)
 
-# --- DÉTECTION DES CATEGORIES & EMOJIS ---
+# --- DÉTECTION DES CATEGORIES & EMOJIS (Corrigé et priorisé) ---
 def categorize_article(title, summary):
     text = f"{title} {summary}".lower()
     
-    # 1. FAITS DIVERS / JUSTICE (Prioritaire)
-    if any(k in text for k in ["s'est jetée", "suicide", "décès", "meurtre", "police", "gendarmerie", "tribunal", "accident", "enquête", "drame", "violences"]):
+    # 1. FAITS DIVERS / JUSTICE / DRAME (Prioritaire absolu)
+    if any(k in text for k in ["jetée", "suicide", "décès", "mort", "meurtre", "police", "gendarmerie", "tribunal", "accident", "enquête", "drame", "violences", "agression", "feu", "incendie"]):
         return "🚨 FAITS DIVERS & JUSTICE"
-    # 2. TRANSPORTS
-    elif any(k in text for k in ["tram", "bus", "tag", "piste cyclable", "a48", "a480", "circulation", "bouchon", "train", "ter", "sncf"]):
+    # 2. TRANSPORTS & CIRCULATION
+    elif any(k in text for k in ["tram", "bus", "tag", "piste cyclable", "a48", "a480", "circulation", "bouchon", "train", "ter", "sncf", "ralentissement"]):
         return "🚌🚗 TRANSPORTS & CIRCULATION"
-    # 3. POLITIQUE / SOCIETE
-    elif any(k in text for k in ["maire", "metropole", "grenoble alpes métropole", "conseil", "élections", "manifestation", "grève"]):
+    # 3. POLITIQUE & SOCIÉTÉ
+    elif any(k in text for k in ["maire", "metropole", "grenoble alpes métropole", "conseil", "élections", "manifestation", "grève", "municipales"]):
         return "🏛️ POLITIQUE & LOCAL"
     # 4. SPORTS
-    elif any(k in text for k in ["fcg", "gf38", "brûleurs de loups", "rugby", "football", "hockey"]):
+    elif any(k in text for k in ["fcg", "gf38", "brûleurs de loups", "rugby", "football", "hockey", "match"]):
         return "⚽ SPORTS"
-    # 5. MONTAGNE / ENVIRONNEMENT
-    elif any(k in text for k in ["chartreuse", "vercors", "belledonne", "station", "ski", "randonnée", "neige"]):
+    # 5. MONTAGNE & NATURE
+    elif any(k in text for k in ["chartreuse", "vercors", "belledonne", "station", "ski", "randonnée", "neige", "avalanche"]):
         return "🏔️ MONTAGNE & NATURE"
     
-    return "📰 ACTUALITÉ LOCAL"
+    return "📰 ACTUALITÉ LOCALE"
 
 # --- EXTRACTION D'IMAGE ---
 def extract_image_url(entry):
-    # 1. Balise enclosure / media:content
     if 'media_content' in entry and len(entry.media_content) > 0:
         return entry.media_content[0].get('url')
     if 'enclosures' in entry and len(entry.enclosures) > 0:
         for enc in entry.enclosures:
             if enc.get('type', '').startswith('image/'):
                 return enc.get('href')
-    # 2. Chercher <img> dans le HTML du résumé
     html_content = entry.get('summary', '') or entry.get('description', '')
     if html_content:
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -159,24 +136,14 @@ def publish_piaille(text):
     except Exception as e:
         logging.error(f"Erreur Piaille: {e}")
 
-def publish_bluesky(text):
-    if not BLUESKY_HANDLE or not BLUESKY_PASSWORD:
-        return
-    try:
-        client = BlueskyClient()
-        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
-        client.send_post(text=text)
-    except Exception as e:
-        logging.error(f"Erreur Bluesky: {e}")
-
-# --- TRAITEMENT ET DIFFUSION DES FLUX ---
+# --- TRAITEMENT DES FLUX ---
 def process_feeds():
-    init_db()
     for feed_url in RSS_FEEDS:
         parsed_feed = feedparser.parse(feed_url)
-        for entry in parsed_feed.entries[:5]: # On inspecte les 5 derniers articles
+        for entry in parsed_feed.entries[:5]:
             link = entry.link
             
+            # Anti-doublon strict basé sur l'historique local
             if is_already_published(link):
                 continue
 
@@ -202,18 +169,16 @@ def process_feeds():
                 f"#Grenoble #Isere #DauphineNews"
             )
 
-            # Publication multi-plateformes
+            # Publication multi-plateformes (Telegram, Facebook, Piaille)
             publish_telegram(msg, image_url)
             publish_facebook(msg, image_url)
             publish_piaille(f"{category}\n\n📌 {title}\n\n{clean_summary}\n\n🔗 {link}\n#Grenoble #Isere")
-            publish_bluesky(f"{category}\n\n📌 {title}\n\n🔗 {link}\n#Grenoble #Isere")
 
-            # Marquer comme publié
+            # Enregistrer pour ne plus jamais le republier
             mark_as_published(link)
-            logging.info(f"Article publié avec succès : {title}")
-            break # Un seul article publié par exécution pour ne pas spammer
+            logging.info(f"Article publié et mémorisé avec succès : {title}")
+            return
 
-# --- ENDPOINTS FLASK ---
 @app.route("/")
 @app.route("/health")
 def health_check():
